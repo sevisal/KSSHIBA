@@ -13,6 +13,8 @@ import torch
 from torch import nn, optim
 import pyro.contrib.gp as gp
 
+import time
+
 class SSHIBA(object):    
     """ Bayessian Inter-Battery Factor Analysis
     SSHIBA method for regression and classification, including multilabel and 
@@ -103,13 +105,16 @@ class SSHIBA(object):
             
         """
         
-        
-        n = []
-        for (m,arg) in enumerate(args):
-            n.append(int(arg['data'].shape[0]))
-        self.n_max = np.max(n)
-        
         self.n = []
+        for (m,arg) in enumerate(args):
+            if type(arg) == dict:
+                self.n.append(int(arg['data'].shape[0]))
+            else:
+                for (mx,x) in enumerate(arg):
+                    self.n.append(int(arg[mx]['data'].shape[0]))
+                    
+        self.n_max = np.max(self.n)
+        
         self.d = []
         self.sparse = []
         self.sparse_fs = []
@@ -124,204 +129,17 @@ class SSHIBA(object):
         self.k = {}
         self.sig = {}
         self.deg = {}
+        self.sparse_K = {}
 
-        m = -1 
+        self.m = -1 
         for arg in args:
-            m += 1
-            if not (None in arg['data']):
-                self.n.append(int(arg['data'].shape[0]))
-                if arg['method'] == 'reg':   #Regression
-                    self.d.append(int(arg['data'].shape[1]))
-                elif arg['method'] == 'cat': #Categorical
-                    self.d.append(int(len(np.unique(arg['data'][~np.isnan(arg['data'])]))))
-                    # if len(arg['data'].shape) < 2:
-                    #     arg['data'] = arg['data'][:, np.newaxis]
-                elif arg['method'] == 'mult': #Multilabel
-                    if len(arg['data'].shape) < 2:
-                        arg['data'] = arg['data'][:, np.newaxis]
-                    self.d.append(int(arg['data'].shape[1]))
-            elif not (None in self.W_init):
-                self.n.append(0)
-                self.d.append(self.W_init[m]['mean'].shape[0])  
-            self.sparse.append(arg['sparse'])
-            self.sparse_fs.append(arg['sparse_fs'])
-            self.center.append(arg['center'])
-            self.method.append(arg['method'])
-            self.area_mask.append(arg['mask'])
-
-            mn = np.random.normal(0.0, 1.0, self.n_max * self.d[m]).reshape(self.n_max, self.d[m])
-            info = {
-                "data":     np.random.normal(0.0, 1.0, self.n_max * self.d[m]).reshape(self.n_max, self.d[m]),
-                "mean":     mn,
-                "cov":      mn**2 ,
-                "prodT":    np.dot(mn.T,mn),
-                "LH":       0,
-                "Elogp":    0,
-                "sumlogdet":    0,
-            }
-            self.X.append(info) 
-
-            #Kernel 
-            data = copy.deepcopy(arg['data'])
-            if not (arg['SV'] is None):
-                self.V[m] = copy.deepcopy(arg['SV'])
-                self.X[m]['X'] = copy.deepcopy(arg['data'])
-                self.k[m] = copy.deepcopy(arg['kernel'])
-                self.sig[m] = copy.deepcopy(arg['sig'])
-                self.deg[m] = arg['deg']
-                #Linear Kernel
-                if self.k[m] == 'linear':
-                    data = np.dot(self.X[m]['X'], self.V[m].T)
-                #RBF Kernel
-                elif self.k[m] == 'rbf': 
-                    if self.sig[m] == 'auto' or self.sparse_fs[m]:
-                        self.sparse_K = SparseELBO(self.X[m]['X'], self.V[m], self.sparse_fs[m])
-                        _, data, var = self.sparse_K.get_params()
-                    else:
-                        data, self.sig[m] = self.rbf_kernel_sig(self.X[m]['X'], self.V[m], sig = self.sig[m])
-                elif self.k[m] == 'poly':
-                    from sklearn.metrics.pairwise import polynomial_kernel
-                    data = polynomial_kernel(self.X[m]['X'], Y = self.V[m], degree = self.deg[m], gamma=arg['sig'])
-                else:
-                    print('Error, selected kernel doesn\'t exist')
-                if self.center[m]:
-                    data = self.center_K(data)
-                self.d[m] = self.V[m].shape[0]
-                
-            #Regression    
-            if arg['method'] == 'reg':   
-                # self.t.append(np.ones((self.n_max,)).astype(int))
-                self.X[m]['data'] = data
-                self.X[m]['mean'] = np.copy(self.X[m]['data'])
-                if self.n_max > self.n[m]:
-                    self.X[m]['mean'] = np.vstack((self.X[m]['mean'],np.NaN * np.ones((self.n_max - self.n[m], self.d[m]))))
-                self.SS_mask[m] = np.isnan(self.X[m]['mean'])
-                #SemiSupervised
-                if np.sum(self.SS_mask[m]) > 0:   
-                    self.SS.append(True)
-                   #If the matrix is preinitialised
-                    if (self.X_init is None):
-                        for d in np.arange(self.d[m]):
-                            if np.sum(self.SS_mask[m][:,d]) == self.SS_mask[m].shape[0]:
-
-                                self.X[m]['mean'][self.SS_mask[m][:,d],d]= np.random.normal(0.0, 1.0, np.sum(self.SS_mask[m][:,d]))
-                            else:
-                                self.X[m]['mean'][self.SS_mask[m][:,d],d] = np.random.normal(np.nanmean(self.X[m]['mean'][:,d],axis=0), np.nanstd(self.X[m]['mean'][:,d],axis=0), np.sum(self.SS_mask[m][:,d]))
-                    else:                        
-                        self.X[m]['mean'][self.SS_mask[m]]  = self.X_init[m]['mean'][self.SS_mask[m]] 
-                    self.X[m]['cov'][~self.SS_mask[m]] = np.zeros((np.sum(~self.SS_mask[m]),))
-                else:
-                    self.SS.append(False)
-                    self.X[m]['cov'] = np.zeros((self.X[m]['mean'].shape))
-
-            #Categorical
-            elif arg['method'] == 'cat':
-                self.t[m] = {
-                    "data":     np.squeeze(data), 
-                    "mean":     (np.random.randint(self.d[m], size=[self.n_max,])).astype(float),
-                }
-                if self.n_max > self.n[m]:
-                    self.t[m]['data'] = np.hstack((self.t[m]['data'], np.NaN * np.ones((self.n_max - self.n[m],))))
-                self.SS_mask[m] = np.isnan(self.t[m]['data'])
-                if np.sum(self.SS_mask[m]) > 0:
-                    self.SS.append(True)
-                    self.t[m]['mean'] = (np.random.randint(self.d[m], size=[self.n_max, ])).astype(float)
-                    self.t[m]['mean'][~self.SS_mask[m]]  = (self.t[m]['data'][~self.SS_mask[m]] ).astype(float)
-                    self.X[m]['mean'][~self.SS_mask[m]] = label_binarize(self.t[m]['mean'][~self.SS_mask[m]], classes = np.arange(self.n_max,self.d[m])).astype(float)
-                    self.X[m]['cov'][~self.SS_mask[m]] = 0
-                else:
-                    self.SS.append(False)
-                    self.t[m]['mean'] = np.copy(self.t[m]['data'])
-                    self.t[m]['cov'] = np.zeros((self.t[m]['mean'].shape))
-                    self.X[m]['mean'] = np.random.normal(0.0, 1.0, self.n_max * self.d[m]).reshape(self.n_max, self.d[m])
-                    self.X[m]['cov'] = np.abs(np.random.normal(0.0, 1.0, self.n_max * self.d[m]).reshape(self.n_max, self.d[m]))
-
-            #Multilabel
-            elif arg['method'] == 'mult': 
-                self.t[m] = copy.deepcopy(info)
-                self.t[m]['data'] = data   
-                if self.n_max > self.n[m]:
-                    self.t[m]['data'] = np.vstack((self.t[m]['data'],np.NaN * np.ones((self.n_max - self.n[m], self.d[m]))))
-                self.SS_mask[m] = np.isnan(self.t[m]['data'])
-                #Initialization of X using t (The values of t are set to 0.95 and 0.05 to avoid computational problems)
-                self.X[m]['mean'][~self.SS_mask[m]] = np.log(np.abs((self.t[m]['data'][~self.SS_mask[m]]).astype(float)-0.05)/(1 - np.abs((self.t[m]['data'][~self.SS_mask[m]]).astype(float)-0.05)))
-                self.X[m]['cov'][~self.SS_mask[m]] = 0
-                for d in np.arange(self.d[m]):
-                    self.X[m]['mean'][self.SS_mask[m][:,d],d] = np.random.normal(np.nanmean(self.X[m]['mean'][~self.SS_mask[m][:,d],d],axis=0), np.nanstd(self.X[m]['mean'][~self.SS_mask[m][:,d],d],axis=0), np.sum(self.SS_mask[m][:,d]))
-                    self.X[m]['cov'][self.SS_mask[m][:,d],d] = np.abs(np.random.normal(np.nanmean(self.X[m]['mean'][~self.SS_mask[m][:,d],d],axis=0), np.nanstd(self.X[m]['mean'][~self.SS_mask[m][:,d],d],axis=0), np.sum(self.SS_mask[m][:,d])))
-
-                #SemiSupervised
-                if np.sum(self.SS_mask[m]) > 0:   
-                    self.SS.append(True)
-                    for d in np.arange(self.d[m]):
-                        self.t[m]['mean'][self.SS_mask[m][:,d],d] = np.random.normal(np.nanmean(self.t[m]['mean'][:,d],axis=0), np.nanstd(self.t[m]['mean'][:,d],axis=0), np.sum(self.SS_mask[m][:,d]))
-
-                    self.t[m]['mean'][~self.SS_mask[m]]  = (self.t[m]['data'][~self.SS_mask[m]] ).astype(float)
-                    self.t[m]['cov'][~self.SS_mask[m]]  = 0
-
-                    # Multilabel semisupervised independent
-                    m_prev = int(np.copy(m))
-                    nans_t = np.sum(np.isnan(self.t[m]['data'][:self.n[m],:]), axis=0)
-                    if any(nans_t != 0) and self.SS_sep:
-                        a = 1 if np.sum(nans_t != 0) != 0 else 0 # If there is no view without nan we keep the first in the original view
-                        for v in np.arange(a, self.d[m])[nans_t[a:] != 0]:
-                            m += 1
-                            self.sparse.append(arg['sparse'])
-                            self.method.append(arg['method'])
-                            self.n.append(int(data.shape[0]))
-                            self.d.append(int(1))
-                            self.SS.append(True)
-                            
-                            self.X.append(copy.deepcopy(info))
-                            self.t.append(copy.deepcopy(self.t[m_prev]))
-                            self.t[m]['data'] = self.t[m_prev]['data'][:,v,np.newaxis]
-                            self.t[m]['mean'] = self.t[m_prev]['mean'][:,v,np.newaxis]
-                            self.t[m]['cov'] = self.t[m_prev]['cov'][:,v,np.newaxis]
-                            self.X[m]['data'] = self.X[m_prev]['data'][:,v,np.newaxis]
-                            self.X[m]['mean'] = self.X[m_prev]['mean'][:,v,np.newaxis]
-                            self.X[m]['cov'] = self.X[m_prev]['cov'][:,v,np.newaxis]
-                            self.SS_mask[m] = np.isnan(self.t[m]['data'])
-
-                        if a: 
-                            self.d[m_prev] = int(1)
-                            self.t[m_prev]['data'] = self.t[m_prev]['data'][:,0,np.newaxis]
-                            self.t[m_prev]['mean'] = self.t[m_prev]['mean'][:,0,np.newaxis]
-                            self.t[m_prev]['cov'] = self.t[m_prev]['cov'][:,0,np.newaxis]
-                            self.X[m_prev]['data'] = self.X[m_prev]['data'][:,0,np.newaxis]
-                            self.X[m_prev]['mean'] = self.X[m_prev]['mean'][:,0,np.newaxis]
-                            self.X[m_prev]['cov'] = self.X[m_prev]['cov'][:,0,np.newaxis]
-                            self.SS_mask[m_prev] = self.SS_mask[m_prev][:,0,np.newaxis]
-                        else:     
-                            self.d[m_prev] = int(np.sum(nans_t == 0))
-                            self.t[m_prev]['data'] = self.t[m_prev]['data'][:,nans_t == 0]
-                            self.t[m_prev]['mean'] = self.t[m_prev]['mean'][:,nans_t == 0]
-                            self.t[m_prev]['cov'] = self.t[m_prev]['cov'][:,nans_t == 0]
-                            self.X[m_prev]['data'] = self.X[m_prev]['data'][:,nans_t == 0]
-                            self.X[m_prev]['mean'] = self.X[m_prev]['mean'][:,nans_t == 0]
-                            self.X[m_prev]['cov'] = self.X[m_prev]['cov'][:,nans_t == 0]
-                            self.SS_mask[m_prev] = self.SS_mask[m_prev][:,nans_t == 0]
-                        
-                    #If the matrix is preinitialised
-                    if not(self.X_init is None): 
-                        #If only the supervised part of the matrix is preinitialised
-                        if self.X_init[m]['mean'].shape[0]<self.n_max: 
-                            self.X[m]['mean'][~self.SS_mask[m]]  = self.X_init[m]['mean'][~self.SS_mask[m]] 
-                            self.X[m]['cov'][~self.SS_mask[m]]  = self.X_init[m]['cov'][~self.SS_mask[m]] 
-                        #If all the matrix is preinitialised          
-                        else: 
-                            self.X[m]['mean'][~self.SS_mask[m]]  = self.X_init[m]['mean'][~self.SS_mask[m]] 
-                            self.X[m]['cov'][~self.SS_mask[m]]  = self.X_init[m]['cov'][~self.SS_mask[m]] 
-                else:
-                    self.SS.append(False)
-                    self.t[m]['mean'] = np.copy(self.t[m]['data']).astype(float)
-                    self.t[m]['cov'] = np.zeros(self.t[m]['mean'].shape)
-                    if not(self.X_init is None):
-                        if np.max(self.X_init[m]['mean']) == 1 and np.min(self.X_init[m]['mean']) == 0:
-                            self.X[m]['mean'] = (2*self.X_init[m]['mean']-1).astype(float) #We cast the variables to a float in case the values used
-                        else:
-                            self.X[m]['mean'] = self.X_init[m]['mean'].astype(float) #We cast the variable to a float in case the values used
-                        self.X[m]['cov'] = self.X_init[m]['cov'].astype(float) #We cast the variable to a float in case the values used
-
+            if type(arg) == dict:
+                self.m += 1
+                self.initializeView(arg)
+            else:
+                for (mx,x) in enumerate(arg):
+                    self.m += 1
+                    self.initializeView(x)
         self.L = []
         self.mse = []
         self.R2 = []
@@ -330,20 +148,217 @@ class SSHIBA(object):
         self.AUC_tr = []
         self.ACC = []
         self.ACC_tr = []
-        
-        self.m = m+1
+
+        self.m = self.m+1
         if self.hyper == None:
             self.hyper = HyperParameters(self.m)
             
         if not (None in self.W_init):
             self.Kc = self.W_init[0]['mean'].shape[1]
- 
         self.q_dist = Qdistribution(self.X, self.n, self.n_max, self.d, self.Kc, self.m, self.sparse, self.method, self.SS, 
                                     self.SS_mask, self.area_mask, self.hyper, 
                                     Z_init = self.Z_init, W_init = self.W_init, alpha_init = self.alpha_init, 
                                     tau_init = self.tau_init, gamma_init = self.gamma_init)               
         self.fit_iterate(**kwargs)
-    
+
+    def initializeView(self, arg):
+        if not (None in arg['data']):
+            if arg['method'] == 'reg':   #Regression
+                self.d.append(int(arg['data'].shape[1]))
+            elif arg['method'] == 'cat': #Categorical
+                self.d.append(int(len(np.unique(arg['data'][~np.isnan(arg['data'])]))))
+            elif arg['method'] == 'mult': #Multilabel
+                if len(arg['data'].shape) < 2:
+                    arg['data'] = arg['data'][:, np.newaxis]
+                self.d.append(int(arg['data'].shape[1]))
+        elif not (None in self.W_init):
+            self.d.append(self.W_init[self.m]['mean'].shape[0])  
+        self.sparse.append(arg['sparse'])
+        self.sparse_fs.append(arg['sparse_fs'])
+        self.center.append(arg['center'])
+        self.method.append(arg['method'])
+        self.area_mask.append(arg['mask'])
+
+        mn = np.random.normal(0.0, 1.0, self.n_max * self.d[self.m]).reshape(self.n_max, self.d[self.m])
+        info = {
+            "mean":     mn,
+            "cov":      mn**2 ,
+            "prodT":    np.dot(mn.T,mn),
+            "LH":       0,
+            "Elogp":    0,
+            "sumlogdet":    0,
+        }
+        self.X.append(info) 
+        data = copy.deepcopy(arg['data'])
+        
+        #Kernel 
+        if not (arg['SV'] is None):
+            V = copy.deepcopy(arg['SV'])
+            X = copy.deepcopy(arg['data'])
+            self.k[self.m] = copy.deepcopy(arg['kernel'])
+            self.sig[self.m] = copy.deepcopy(arg['sig'])
+            self.deg[self.m] = arg['deg']
+            if self.d[self.m] > 1e5:
+                print('Constructing kernel, this might take a while.')
+            #Linear Kernel
+            if self.k[self.m] == 'linear':
+                if self.sparse_fs[self.m]:
+                    self.sparse_K[self.m] = SparseELBO(X, V, self.sparse_fs[self.m], kernel = self.k[self.m])
+                    data = self.sparse_K[self.m].get_params()[0]
+                    self.it_fs = 1
+                else: 
+                    data = np.dot(X, V.T)
+            #RBF Kernel
+            elif self.k[self.m] == 'rbf': 
+                if self.sig[self.m] == 'auto' or self.sparse_fs[self.m]:
+                    self.sparse_K[self.m] = SparseELBO(X, V, self.sparse_fs[self.m])
+                    data = self.sparse_K[self.m].get_params()[0]
+                    self.it_fs = 1
+                else:
+                    data, self.sig[self.m] = self.rbf_kernel_sig(X, V, sig = self.sig[self.m])
+            elif self.k[self.m] == 'poly':
+                from sklearn.metrics.pairwise import polynomial_kernel
+                data = polynomial_kernel(X, Y = V, degree = self.deg[self.m], gamma=arg['sig'])
+            else:
+                print('Error, selected kernel doesn\'t exist')
+            if self.center[self.m]:
+                data = self.center_K(data)
+            self.d[self.m] = V.shape[0]
+            self.X[self.m]['cov'] = np.random.normal(0.0, 1.0, self.n_max * self.d[self.m]).reshape(self.n_max, self.d[self.m])**2
+            
+        #Regression    
+        if arg['method'] == 'reg':   
+            # self.t.append(np.ones((self.n_max,)).astype(int))
+            self.X[self.m]['mean'] = data
+            if self.n_max > self.n[self.m]:
+                self.X[self.m]['mean'] = np.vstack((self.X[self.m]['mean'],np.NaN * np.ones((self.n_max - self.n[self.m], self.d[self.m]))))
+            self.SS_mask[self.m] = np.isnan(self.X[self.m]['mean'])
+            #SemiSupervised
+            if np.sum(self.SS_mask[self.m]) > 0:   
+                self.SS.append(True)
+               #If the matrix is preinitialised
+                if (self.X_init is None):
+                    for d in np.arange(self.d[self.m]):
+                        if np.sum(self.SS_mask[self.m][:,d]) == self.SS_mask[self.m].shape[0]:
+
+                            self.X[self.m]['mean'][self.SS_mask[self.m][:,d],d]= np.random.normal(0.0, 1.0, np.sum(self.SS_mask[self.m][:,d]))
+                        else:
+                            self.X[self.m]['mean'][self.SS_mask[self.m][:,d],d] = np.random.normal(np.nanmean(self.X[self.m]['mean'][:,d],axis=0), np.nanstd(self.X[self.m]['mean'][:,d],axis=0), np.sum(self.SS_mask[self.m][:,d]))
+                else:                        
+                    self.X[self.m]['mean'][self.SS_mask[self.m]]  = self.X_init[self.m]['mean'][self.SS_mask[self.m]] 
+                self.X[self.m]['cov'][~self.SS_mask[self.m]] = np.zeros((np.sum(~self.SS_mask[self.m]),))
+            else:
+                self.SS.append(False)
+                self.X[self.m]['cov'] = np.zeros((self.X[self.m]['mean'].shape))
+
+        #Categorical
+        elif arg['method'] == 'cat':
+            self.t[self.m] = {
+                "mean":     (np.random.randint(self.d[self.m], size=[self.n_max,])).astype(float),
+            }
+            data = np.squeeze(data)
+            if self.n_max > self.n[self.m]:
+                data = np.hstack((data, np.NaN * np.ones((self.n_max - self.n[self.m],))))
+            self.SS_mask[self.m] = np.isnan(data)
+            if np.sum(self.SS_mask[self.m]) > 0:
+                self.SS.append(True)
+                self.t[self.m]['mean'] = (np.random.randint(self.d[self.m], size=[self.n_max, ])).astype(float)
+                self.t[self.m]['mean'][~self.SS_mask[self.m]]  = (data[~self.SS_mask[self.m]] ).astype(float)
+                self.X[self.m]['mean'][~np.repeat(self.SS_mask[self.m][:,np.newaxis], self.d[self.m],axis=1)] = label_binarize(self.t[self.m]['mean'][~self.SS_mask[self.m]], classes = np.arange(self.d[self.m])).astype(float).flatten()
+                self.X[self.m]['cov'][~np.repeat(self.SS_mask[self.m][:,np.newaxis], self.d[self.m],axis=1)] = 0
+            else:
+                self.SS.append(False)
+                self.t[self.m]['mean'] = np.copy(data)
+                self.t[self.m]['cov'] = np.zeros((self.t[self.m]['mean'].shape))
+                self.X[self.m]['mean'] = np.random.normal(0.0, 1.0, self.n_max * self.d[self.m]).reshape(self.n_max, self.d[self.m])
+                self.X[self.m]['cov'] = np.abs(np.random.normal(0.0, 1.0, self.n_max * self.d[self.m]).reshape(self.n_max, self.d[self.m]))
+
+        #Multilabel
+        elif arg['method'] == 'mult': 
+            self.t[self.m] = copy.deepcopy(info)
+            if self.n_max > self.n[self.m]:
+                data = np.vstack((data,np.NaN * np.ones((self.n_max - self.n[self.m], self.d[self.m]))))
+            self.SS_mask[self.m] = np.isnan(data)
+            #Initialization of X using t (The values of t are set to 0.95 and 0.05 to avoid computational problems)
+            self.X[self.m]['mean'][~self.SS_mask[self.m]] = np.log(np.abs((data[~self.SS_mask[self.m]]).astype(float)-0.05)/(1 - np.abs((data[~self.SS_mask[self.m]]).astype(float)-0.05)))
+            self.X[self.m]['cov'][~self.SS_mask[self.m]] = 0
+            for d in np.arange(self.d[self.m]):
+                self.X[self.m]['mean'][self.SS_mask[self.m][:,d],d] = np.random.normal(np.nanmean(self.X[self.m]['mean'][~self.SS_mask[self.m][:,d],d],axis=0), np.nanstd(self.X[self.m]['mean'][~self.SS_mask[self.m][:,d],d],axis=0), np.sum(self.SS_mask[self.m][:,d]))
+                self.X[self.m]['cov'][self.SS_mask[self.m][:,d],d] = np.abs(np.random.normal(np.nanmean(self.X[self.m]['mean'][~self.SS_mask[self.m][:,d],d],axis=0), np.nanstd(self.X[self.m]['mean'][~self.SS_mask[self.m][:,d],d],axis=0), np.sum(self.SS_mask[self.m][:,d])))
+
+            #SemiSupervised
+            if np.sum(self.SS_mask[self.m]) > 0:   
+                self.SS.append(True)
+                for d in np.arange(self.d[self.m]):
+                    self.t[self.m]['mean'][self.SS_mask[self.m][:,d],d] = np.random.normal(np.nanmean(self.t[self.m]['mean'][:,d],axis=0), np.nanstd(self.t[self.m]['mean'][:,d],axis=0), np.sum(self.SS_mask[self.m][:,d]))
+
+                self.t[self.m]['mean'][~self.SS_mask[self.m]]  = (data[~self.SS_mask[self.m]] ).astype(float)
+                self.t[self.m]['cov'][~self.SS_mask[self.m]]  = 0
+
+                # Multilabel semisupervised independent
+                m_prev = int(np.copy(self.m))
+                nans_t = np.sum(np.isnan(data[:self.n[self.m],:]), axis=0)
+                if any(nans_t != 0) and self.SS_sep:
+                    a = 1 if np.sum(nans_t != 0) != 0 else 0 # If there is no view without nan we keep the first in the original view
+                    for v in np.arange(a, self.d[self.m])[nans_t[a:] != 0]:
+                        self.m += 1
+                        self.sparse.append(arg['sparse'])
+                        self.method.append(arg['method'])
+                        self.n.append(int(data.shape[0]))
+                        self.d.append(int(1))
+                        self.SS.append(True)
+                        
+                        self.X.append(copy.deepcopy(info))
+                        self.t.append(copy.deepcopy(self.t[m_prev]))
+                        # self.t[self.m]['data'] = self.t[m_prev]['data'][:,v,np.newaxis]
+                        self.t[self.m]['mean'] = self.t[m_prev]['mean'][:,v,np.newaxis]
+                        self.t[self.m]['cov'] = self.t[m_prev]['cov'][:,v,np.newaxis]
+                        # self.X[self.m]['data'] = self.X[m_prev]['data'][:,v,np.newaxis]
+                        self.X[self.m]['mean'] = self.X[m_prev]['mean'][:,v,np.newaxis]
+                        self.X[self.m]['cov'] = self.X[m_prev]['cov'][:,v,np.newaxis]
+                        self.SS_mask[self.m] = np.isnan(data)
+
+                    if a: 
+                        self.d[m_prev] = int(1)
+                        # self.t[m_prev]['data'] = self.t[m_prev]['data'][:,0,np.newaxis]
+                        self.t[m_prev]['mean'] = self.t[m_prev]['mean'][:,0,np.newaxis]
+                        self.t[m_prev]['cov'] = self.t[m_prev]['cov'][:,0,np.newaxis]
+                        # self.X[m_prev]['data'] = self.X[m_prev]['data'][:,0,np.newaxis]
+                        self.X[m_prev]['mean'] = self.X[m_prev]['mean'][:,0,np.newaxis]
+                        self.X[m_prev]['cov'] = self.X[m_prev]['cov'][:,0,np.newaxis]
+                        self.SS_mask[m_prev] = self.SS_mask[m_prev][:,0,np.newaxis]
+                    else:     
+                        self.d[m_prev] = int(np.sum(nans_t == 0))
+                        # self.t[m_prev]['data'] = self.t[m_prev]['data'][:,nans_t == 0]
+                        self.t[m_prev]['mean'] = self.t[m_prev]['mean'][:,nans_t == 0]
+                        self.t[m_prev]['cov'] = self.t[m_prev]['cov'][:,nans_t == 0]
+                        # self.X[m_prev]['data'] = self.X[m_prev]['data'][:,nans_t == 0]
+                        self.X[m_prev]['mean'] = self.X[m_prev]['mean'][:,nans_t == 0]
+                        self.X[m_prev]['cov'] = self.X[m_prev]['cov'][:,nans_t == 0]
+                        self.SS_mask[m_prev] = self.SS_mask[m_prev][:,nans_t == 0]
+                    
+                #If the matrix is preinitialised
+                if not(self.X_init is None): 
+                    #If only the supervised part of the matrix is preinitialised
+                    if self.X_init[self.m]['mean'].shape[0]<self.n_max: 
+                        self.X[self.m]['mean'][~self.SS_mask[self.m]]  = self.X_init[self.m]['mean'][~self.SS_mask[self.m]] 
+                        self.X[self.m]['cov'][~self.SS_mask[self.m]]  = self.X_init[self.m]['cov'][~self.SS_mask[self.m]] 
+                    #If all the matrix is preinitialised          
+                    else: 
+                        self.X[self.m]['mean'][~self.SS_mask[self.m]]  = self.X_init[self.m]['mean'][~self.SS_mask[self.m]] 
+                        self.X[self.m]['cov'][~self.SS_mask[self.m]]  = self.X_init[self.m]['cov'][~self.SS_mask[self.m]] 
+            else:
+                self.SS.append(False)
+                self.t[self.m]['mean'] = data.astype(float)
+                self.t[self.m]['cov'] = np.zeros(self.t[self.m]['mean'].shape)
+                if not(self.X_init is None):
+                    if np.max(self.X_init[self.m]['mean']) == 1 and np.min(self.X_init[self.m]['mean']) == 0:
+                        self.X[self.m]['mean'] = (2*self.X_init[self.m]['mean']-1).astype(float) #We cast the variables to a float in case the values used
+                    else:
+                        self.X[self.m]['mean'] = self.X_init[self.m]['mean'].astype(float) #We cast the variable to a float in case the values used
+                    self.X[self.m]['cov'] = self.X_init[self.m]['cov'].astype(float) #We cast the variable to a float in case the values used
+                    
+            
     def fit_iterate(self, max_iter = int(1e3), pruning_crit = 1e-6, tol = 1e-3, feat_crit = 1e-6, perc = False, verbose = 0, Y_tst = [None], 
                     X_tst = [None], X_tr = [None], HL = 0, AUC = 0, ACC= 0, mse = 0, R2 = 0, m_in = [0], m_out = 1):
         """Iterate to fit model to data.
@@ -386,10 +401,16 @@ class SSHIBA(object):
             if any(self.sparse):
                 if self.fs:
                     self.feature_selection(feat_crit, perc)
+                    for m in np.arange(self.m):
+                        if q.d[m] == 0:
+                            print('\nThere are no representative features.')
+                            return
             if verbose:
                 verboseprint('\rIteration %d Lower Bound %.1f K %4d' %(len(self.L),self.L[-1], q.Kc), end='\r', flush=True)
             # Lower Bound convergence criteria
-            if (len(self.L) > 100) and (abs(1 - np.mean(self.L[-101:-1])/self.L[-1]) < tol):
+            
+            if (len(self.L) > 10) and (abs(1 - np.mean(self.L[-101:-1])/self.L[-1]) < tol):
+            # if (len(self.L) > 1) and  1 - np.mean(self.L[-2:])/self.L[-1] < tol:
                 verboseprint('\nModel correctly trained. Convergence achieved')             
                 return
         verboseprint('')
@@ -441,11 +462,9 @@ class SSHIBA(object):
         """
         
         q = self.q_dist
-        fact_sel = np.array([])
+        fact_sel = []
         for m in np.arange(self.m):
-            for K in np.arange(q.Kc):
-                if any(abs(q.W[m]['mean'][:,K])>pruning_crit):
-                    fact_sel = np.append(fact_sel,K)
+            fact_sel = fact_sel + np.where(np.any(abs(q.W[m]['mean'])>pruning_crit, axis=0))[0].tolist()
         fact_sel = np.unique(fact_sel).astype(int)
         # Pruning Z
         q.Z['mean'] = q.Z['mean'][:,fact_sel]
@@ -511,6 +530,7 @@ class SSHIBA(object):
                     for d in np.arange(self.d[m]):
                         if any(abs(q.W[m]['mean'][d,:])<feat_crit):
                             feat_sel[m] = np.append(feat_sel[m],d).astype(int)
+                            
         # FS W and gamma
         for m in np.arange(self.m):
             if self.sparse[m]:
@@ -598,7 +618,7 @@ class SSHIBA(object):
                 
         elif self.method[m_out] == 'cat':
             if self.SS[m_out]:
-                Y_pred = self.t[m_out]['mean'][-n_tst:,]
+                Y_pred = self.q_dist.tc[m_out][-n_tst:,:] #self.t[m_out]['mean'][-n_tst:,]
             else:
                 Y_pred = self.predict(m_in, m_out, X_tst)
                 
@@ -661,23 +681,26 @@ class SSHIBA(object):
         p_class = np.sum(Y_tst_bin,axis=0)/np.sum(Y_tst_bin)
         return np.sum(self.calcAUC(Y_pred, Y_tst_bin)*p_class)
     
+    def mult2lbl(self, Y):
+        if (len(Y.shape) < 2) | (Y.shape[1] == 1):
+            return (Y > 0.5).astype(float).flatten()
+        else:
+            return np.argmax(Y, axis=1)
+
     def compute_ACC(self, Y_tst, X_tst, m_in=[0], m_out=1):
         if not(type(X_tst) == dict):
             m_in = np.arange(self.m-1)
             m_out = self.m-1
         Y_pred = self.compute_predictions(X_tst, m_in=m_in, m_out=m_out)
         if self.method[m_out] == 'reg':
-            Y_pred = np.argmax(Y_pred, axis=1)
-            Y_real = np.argmax(Y_tst['data'], axis=1)
+            Y_pred = self.mult2lbl(Y_pred)
+            Y_real = self.mult2lbl(Y_tst['data'])
         if self.method[m_out] == 'cat':
             Y_real = Y_tst['data'].flatten()
             Y_pred = (np.ones((Y_pred.shape[0], self.d[m_out])) * np.unique(Y_tst['data']))[label_binarize(np.argmax(abs(Y_pred),axis=1), classes = np.arange(self.d[m_out])).astype(bool)]
         if self.method[m_out] == 'mult':
-            Y_pred = np.argmax(Y_pred, axis=1)
-            if len(Y_tst['data'].shape) < 2:
-                Y_real = Y_tst['data'].flatten()
-            else:
-                Y_real = np.argmax(Y_tst['data'], axis=1)
+            Y_pred = self.mult2lbl(Y_pred)
+            Y_real = self.mult2lbl(Y_tst['data'])
         return accuracy_score(Y_real, Y_pred)
     
     def update(self, Y_tst=[None], X_tst=[None], X_tr=[None], HL=0, AUC=0, ACC=0, mse=0, R2=0, m_in=[0], m_out=1):
@@ -701,14 +724,14 @@ class SSHIBA(object):
             
         """
 
-        q = self.q_dist   
+        q = self.q_dist
         
         for m in np.arange(self.m):  
             self.update_w(m)
         self.update_Z()
         for m in np.arange(self.m):   
-            batch = np.arange(self.n[m])
-            np.random.shuffle(batch)
+            # batch = np.arange(self.n[m])
+            # np.random.shuffle(batch)
             #Regression
             if self.method[m] == 'reg':
                 if self.SS[m]:
@@ -716,11 +739,11 @@ class SSHIBA(object):
                     self.update_xs(m)
                     self.X[m]['mean'][self.SS_mask[m]] = q.XS[m]['mean'][self.SS_mask[m]]
                     self.X[m]['cov'][self.SS_mask[m]] = q.XS[m]['cov'][0,0]
-                    self.X[m]['prodT'] = np.zeros((q.d[m],q.d[m]))
-                    self.X[m]['sumlogdet'] = 0
-                    for n in np.arange(self.n_max):                 
-                        self.X[m]['prodT'] += np.dot(self.X[m]['mean'][n,np.newaxis].T, self.X[m]['mean'][n,np.newaxis]) + np.diag(self.X[m]['cov'][n,:])
-                        self.X[m]['sumlogdet'] += np.linalg.slogdet(np.diag(self.X[m]['cov'][n,self.SS_mask[m][n,:]]))[1]
+                    self.X[m]['prodT'] = np.dot(self.X[m]['mean'].T, self.X[m]['mean']) + np.diag(np.sum(self.X[m]['cov'],axis=0))
+                    X_SS = np.copy(self.X[m]['cov']) # We define a copy of X's covariance matrix to set the observed values to 1 in order to calculate the log determinant
+                    X_SS[~self.SS_mask[m]] = 1
+                    self.X[m]['sumlogdet'] = np.sum(np.log(X_SS))
+                    del X_SS
                 else:
                     self.X[m]['prodT'] = np.dot(self.X[m]['mean'].T, self.X[m]['mean'])
                 #Update of the variable tau
@@ -755,14 +778,22 @@ class SSHIBA(object):
             self.update_alpha(m)
             
             # if self.sparse_fs[m] and len(self.L) < 50:
-            if m in self.k.keys() and self.k[m] == 'rbf' and self.sparse_fs[m] and len(self.L) < 100:
-                self.sparse_K.sgd_step(q.Z['mean']@q.W[m]['mean'].T, 20)
+            if m in self.k.keys() and self.sparse_fs[m] and self.it_fs and len(self.L) > 1:
+                var_fs = self.sparse_K[m].get_params()[1]
+                self.sparse_K[m].sgd_step(q.Z['mean']@q.W[m]['mean'].T, 20)
                 if self.SS[m]:
                     print('Semisupervised version not implemented yet')
                 else:
-                    _, kernel, var = self.sparse_K.get_params()
+                    kernel = self.sparse_K[m].get_params()[0]
                     self.X[m]['mean'] = self.center_K(kernel)
-
+                    if abs(np.mean(self.sparse_K[m].get_params()[1] - var_fs)) < 1e-6 or abs(self.L[-2]) > abs(self.L[-1]) or len(self.L) > 10:
+                        self.it_fs = 0
+                    #######################################
+                    # print('\n'+str(np.max(self.sparse_K[m].get_params()[1])))
+                    # print(np.min(self.sparse_K[m].get_params()[1]))
+                    # print(np.mean(np.abs(self.sparse_K[m].get_params()[1] - var_fs)))
+                    # print(np.min(self.sparse_K[m].get_params()[1]) / np.max(self.sparse_K[m].get_params()[1]))
+                    #######################################
         if not(None in Y_tst):
             if HL: 
                 self.HL.append(self.compute_HL(Y_tst, X_tst, m_in, m_out))
@@ -790,8 +821,7 @@ class SSHIBA(object):
         
         try:
             L = linalg.pinv(np.linalg.cholesky(X), rcond=1e-10) #np.linalg.cholesky(A)
-            B = np.dot(L.T,L) #linalg.pinv(L)*linalg.pinv(L.T)
-            return B
+            return np.dot(L.T,L) #linalg.pinv(L)*linalg.pinv(L.T)
         except:
             return np.nan
         
@@ -844,6 +874,7 @@ class SSHIBA(object):
             q.Z['mean'] = np.dot(mn,q.Z['cov'])
             # E[Y*Y^T]
             q.Z['prodT'] = np.dot(q.Z['mean'].T, q.Z['mean']) + self.n_max*q.Z['cov'] 
+            del aux, Z_cov, mn
         else:
             print ('Cov Z is not invertible, not updated')
     
@@ -903,14 +934,14 @@ class SSHIBA(object):
                         q.W[m]['sumlogdet'] += np.linalg.slogdet(w_cov)[1]
                     else:
                         print ('Cov W is not invertible, not updated')
+            del A, U, S, UH, I, AUH, UA, w_cov
         else:
             # cov
-            # w_cov = self.myInverse(np.diag(q.alpha_mean(m)) + q.tau_mean(m) * q.Z['prodT'])
+            w_cov = self.myInverse(np.diag(q.alpha_mean(m)) + q.tau_mean(m) * q.Z['prodT'])
             # Efficient and robust way of computing:  solve(diag(alpha) + tau * ZZ^T)
-            tmp = 1/np.sqrt(q.alpha_mean(m))
-            aux = np.outer(tmp,tmp)*q.Z['prodT'] + np.eye(q.Kc)/q.tau_mean(m)
-            cho = np.linalg.cholesky(aux)            
-            w_cov = 1/q.tau_mean(m) * np.outer(tmp,tmp) * np.dot(linalg.pinv(cho.T),linalg.pinv(cho))
+            # tmp = 1/np.sqrt(q.alpha_mean(m))
+            # cho = np.linalg.cholesky(np.outer(tmp,tmp)*q.Z['prodT'] + np.eye(q.Kc)/q.tau_mean(m))            
+            # w_cov = 1/q.tau_mean(m) * np.outer(tmp,tmp) * np.dot(linalg.pinv(cho.T),linalg.pinv(cho))
             
             if not np.any(np.isnan(w_cov)):
                 q.W[m]['cov'] = w_cov
@@ -919,7 +950,8 @@ class SSHIBA(object):
                 #E[W*W^T]
                 q.W[m]['prodT'] = np.dot(q.W[m]['mean'].T, q.W[m]['mean']) + self.d[m]*q.W[m]['cov']
             else:
-                print ('Cov W' + str(m) + ' is not invertible, not updated')           
+                print ('Cov W' + str(m) + ' is not invertible, not updated')   
+            del w_cov
             
     def update_b(self,m):
         """Updates the variable b.
@@ -1009,7 +1041,7 @@ class SSHIBA(object):
         
         q = self.q_dist
         # cov
-        q.XS[m]['cov'] = q.tau_mean(m)**(-1)*np.eye(self.d[m])
+        q.XS[m]['cov'] = (q.tau_mean(m)**(-1)*np.eye(self.d[m])).astype(float)
         # mean
         q.XS[m]['mean'] = np.add(np.dot(q.Z['mean'],q.W[m]['mean'].T), q.b[m]['mean'])
     
@@ -1030,11 +1062,10 @@ class SSHIBA(object):
         # mean
         q.tS[m]['mean'] = self.sigmoid(self.X[m]['mean'])
         # cov
-        q.tS[m]['cov'] = np.exp(np.subtract(np.log(q.tS[m]['mean']), np.log((1 + np.exp(self.X[m]['mean'])))))
+        # q.tS[m]['cov'] = np.exp(np.subtract(np.log(q.tS[m]['mean']), np.log((1 + np.exp(self.X[m]['mean'])))))
+        q.tS[m]['cov'] = np.exp(np.subtract(self.X[m]['mean'], 2*np.log((1 + np.exp(self.X[m]['mean'])))))
         # sum(log(det(X)))
-        q.tS[m]['sumlogdet'] = 0
-        for n in np.arange(self.n[m],self.n_max):
-            q.tS[m]['sumlogdet'] += np.linalg.slogdet(np.diag(q.tS[m]['cov'][n,:]))[1]
+        q.tS[m]['sumlogdet'] = np.sum(np.log(q.tS[m]['cov']))
             
     def update_x(self,m): #Multilabel
         """Updates the variable X.
@@ -1050,18 +1081,10 @@ class SSHIBA(object):
         """
         
         q = self.q_dist
-        self.X[m]['prodT'] = np.zeros((q.d[m],q.d[m]))
-        self.X[m]['sumlogdet'] = 0
-        
-        for n in np.arange(self.n_max):
-            # cov
-            self.X[m]['cov'][n,:] = (q.tau_mean(m) + 2*self.lambda_func(q.xi[m][n,:]))**(-1) #We store only the diagonal of the covariance matrix
-            # mean
-            self.X[m]['mean'][n,:] = np.dot((self.t[m]['mean'][n,:] - 0.5 + q.tau_mean(m)*(np.dot(q.Z['mean'][n,:],q.W[m]['mean'].T) + q.b[m]['mean'])),np.diag(self.X[m]['cov'][n,:]))
-            # prodT
-            self.X[m]['prodT'] += np.dot(self.X[m]['mean'][n,np.newaxis].T, self.X[m]['mean'][n,np.newaxis]) + np.diag(self.X[m]['cov'][n,:])
-            # sum(log(det(X)))
-            self.X[m]['sumlogdet'] += np.linalg.slogdet(np.diag(self.X[m]['cov'][n,:]))[1]
+        self.X[m]['cov'] = (q.tau_mean(m) + 2*self.lambda_func(q.xi[m]))**(-1)
+        self.X[m]['mean'] = (self.t[m]['mean'] - 0.5 + q.tau_mean(m)*(np.dot(q.Z['mean'], q.W[m]['mean'].T) + q.b[m]['mean'])) * self.X[m]['cov']
+        self.X[m]['prodT'] = np.dot(self.X[m]['mean'].T, self.X[m]['mean']) + np.diag(np.sum(self.X[m]['cov'],axis=0))
+        self.X[m]['sumlogdet'] = np.sum(np.log(self.X[m]['cov']))
 
     def update_xi(self,m): #Multilabel    
         """Updates the variable xi.
@@ -1133,53 +1156,30 @@ class SSHIBA(object):
         """
         
         q = self.q_dist
-        m_worm = np.dot(q.Z['mean'],q.W[m]['mean'].T) + q.b[m]['mean']
+        y = np.dot(q.Z['mean'],q.W[m]['mean'].T) + q.b[m]['mean']
+           
+        set_classes = np.unique(self.t[m]['mean']).astype(int) 
+        t_b = label_binarize(self.t[m]['mean'], classes=set_classes).astype(bool)
+        if t_b.shape[1] == 1:
+            t_b = np.hstack((~t_b, t_b))              
+        y_i = y[t_b]
+        y_j = y[~t_b].reshape(self.n_max,self.d[m]-1)
+        #Aproximation of the expectation
+        # xi = self.expectation_aprx(m_wormi, m_wormj) + 1e-10
+        #Mean value for Xnj / j!=i
+        exp_j = np.zeros((self.n_max,self.d[m]-1))
+        for j in np.arange(self.d[m]-1):
+            # y_k = y_j[:,np.arange(self.d[m]-1)!=j] #it extracts the mean of the values there are neither i nor j
+            exp_j[:,j] = self.expectation_aprx(y_i, y_j[:,np.arange(self.d[m]-1)!=j], c = y_j[:,j])
+        # mean
+        self.X[m]['mean'][~t_b] = (y_j - (exp_j.T/self.expectation_aprx(y_i, y_j) + 1e-10).T).flatten()
+        self.X[m]['mean'][t_b] = y_i + np.sum(y_j - self.X[m]['mean'][~t_b].reshape(self.n_max,self.d[m]-1),axis=1)
+        self.X[m]['prodT'] = np.dot(self.X[m]['mean'].T, self.X[m]['mean'])
 
-        #Obtain the class-wise m_worm
-        if self.SS[m]:
-            self.X[m]['mean'] = np.zeros((self.n_max,self.d[m]))
-            for i in np.arange(self.d[m]-1):
-                m_wormi = m_worm[:,i].flatten()
-                not_i = np.arange(self.d[m])!=i
-                m_wormj = m_worm[:,not_i]
-                #Aproximation of the expectation
-                xi = self.expectation_aprx(m_wormi, m_wormj)
-                #Mean value for Xnj / j!=i
-                expj = np.zeros((self.n_max,self.d[m]-1))
-                for j in np.arange(self.d[m]-1):
-                    m_wormk = m_wormj[:,np.arange(self.d[m]-1)!=j] #it extracts the mean of the values there are neither i nor j
-                    expj[:,j] = self.expectation_aprx(m_wormi, m_wormk, c = m_wormj[:,j])
-                # mean
-                x_i = np.zeros((self.n_max,self.d[m]))
-                x_i[:,not_i] = m_wormj - (expj.T/xi).T
-                x_i[:,i] = m_wormi + np.sum(m_wormj - x_i[:,not_i],axis=1)
-                self.X[m]['mean'] += x_i * q.tc[m][:,i,np.newaxis]
-        else:            
-            set_classes = np.unique(self.t[m]['data']).astype(int) 
-            t_b = label_binarize(self.t[m]['data'], classes=set_classes).astype(bool)
-            m_wormi = m_worm[t_b]
-            m_wormj = m_worm[~t_b].reshape(self.n_max,self.d[m]-1)
-            #Aproximation of the expectation
-            xi = self.expectation_aprx(m_wormi, m_wormj) + 1e-10
-            #Mean value for Xnj / j!=i
-            expj = np.zeros((self.n_max,self.d[m]-1))
-            for j in np.arange(self.d[m]-1):
-                m_wormk = m_wormj[:,np.arange(self.d[m]-1)!=j] #it extracts the mean of the values there are neither i nor j
-                expj[:,j] = self.expectation_aprx(m_wormi, m_wormk, c = m_wormj[:,j])
-            # mean
-            self.X[m]['mean'][~t_b] = (m_wormj - (expj.T/xi).T).flatten()
-            self.X[m]['mean'][t_b] = m_wormi + np.sum(m_wormj - self.X[m]['mean'][~t_b].reshape(self.n_max,self.d[m]-1),axis=1)
-            self.X[m]['prodT'] = np.dot(self.X[m]['mean'].T, self.X[m]['mean'])
-            
     def update_tc(self,m): #Semisupervised categorical
-
         q = self.q_dist
-        m_worm = np.dot(q.Z['mean'],q.W[m]['mean'].T) + q.b[m]['mean']
         for i in np.arange(self.d[m]):
-            m_wormi = m_worm[:,np.arange(self.d[m]) == i].flatten()
-            m_wormj = m_worm[:,np.arange(self.d[m]) != i]
-            q.tc[m][:,i] = self.expectation_aprx(m_wormi, m_wormj)
-        # self.X[m]['mean'][~t_b] = (m_wormj - (expj.T/xi).T).flatten()
+            q.tc[m][:,i] = self.expectation_aprx(self.X[m]['mean'][:,np.arange(self.d[m]) == i].flatten(), self.X[m]['mean'][:,np.arange(self.d[m]) != i])
             
     def predict(self, m_in, m_out, *args):
         """Apply the model learned in the training process to new data.
@@ -1232,12 +1232,12 @@ class SSHIBA(object):
                     #Feature selection
                     #Lineal Kernel
                     if k == 'linear':
-                        arg['data'] = np.dot(self.X[m]['X'], self.V[m].T)
+                        arg['data'] = np.dot(X, V.T)
                     #RBF Kernel
                     elif k == 'rbf': 
                         if sig == 'auto':
-                            self.sparse_K = SparseELBO(X, V, self.sparse_fs[m])
-                            _, arg['data'], _ = self.sparse_K.get_params()
+                            self.sparse_K[m] = SparseELBO(X, V, self.sparse_fs[m])
+                            arg['data'], _ = self.sparse_K[m].get_params()[0]
                         else:
                             arg['data'], sig = self.rbf_kernel_sig(X, V, sig = sig)
                     if center:
@@ -1260,38 +1260,33 @@ class SSHIBA(object):
         #Regression
         if self.method[m_out] == 'reg':   
             #Expectation X
-            mean_x = np.dot(self.Z_mean,q.W[m_out]['mean'].T) + q.b[m_out]['mean']
+            # mean_x = np.dot(self.Z_mean,q.W[m_out]['mean'].T) + q.b[m_out]['mean']
             #Variance X
-            var_x = q.tau_mean(m_out)**(-1)*np.eye(self.d[m_out]) + np.linalg.multi_dot([q.W[m_out]['mean'], Z_cov, q.W[m_out]['mean'].T])                 
+            # var_x = q.tau_mean(m_out)**(-1)*np.eye(self.d[m_out]) + np.linalg.multi_dot([q.W[m_out]['mean'], Z_cov, q.W[m_out]['mean'].T])                 
             
-            return mean_x, var_x
+            # return mean_x, var_x
+            return np.dot(self.Z_mean,q.W[m_out]['mean'].T) + q.b[m_out]['mean'], q.tau_mean(m_out)**(-1)*np.eye(self.d[m_out]) + np.linalg.multi_dot([q.W[m_out]['mean'], Z_cov, q.W[m_out]['mean'].T])                 
         
         #Categorical
         elif self.method[m_out] == 'cat': 
-#            p_t = np.dot(self.Z_mean,q.W[m_out]['mean'].T)
-#            pred = np.argmax(abs(p_t),axis=1)
-            
             p_t = np.zeros((n_pred,self.d[m_out]))
-            m_worm = np.dot(self.Z_mean,q.W[m_out]['mean'].T) + q.b[m_out]['mean']
+            y = np.dot(self.Z_mean,q.W[m_out]['mean'].T) + q.b[m_out]['mean']
             for i in np.arange(self.d[m_out]):
-                m_wormi = m_worm[:,np.arange(self.d[m_out]) == i].flatten()
-                m_wormj = m_worm[:,np.arange(self.d[m_out]) != i]
-                p_t[:,i] = self.expectation_aprx(m_wormi, m_wormj, n = n_pred)
-            # pred = np.argmax(abs(p_t),axis=1)
-            # return pred    
+                p_t[:,i] = self.expectation_aprx(y[:,np.arange(self.d[m_out]) == i].flatten(), y[:,np.arange(self.d[m_out]) != i], n = n_pred)
+            # return np.argmax(abs(p_t),axis=1)    
             return p_t
          
         #Multilabel
         elif self.method[m_out] == 'mult': 
             #Expectation X
-            m_x = np.dot(self.Z_mean, q.W[m_out]['mean'].T) + q.b[m_out]['mean']  
+            # m_x = np.dot(self.Z_mean, q.W[m_out]['mean'].T) + q.b[m_out]['mean']  
             #Variance X
-            var_x = q.tau_mean(m_out)**(-1)*np.eye(self.d[m_out]) + np.linalg.multi_dot([q.W[m_out]['mean'], Z_cov, q.W[m_out]['mean'].T])
+            # var_x = q.tau_mean(m_out)**(-1)*np.eye(self.d[m_out]) + np.linalg.multi_dot([q.W[m_out]['mean'], Z_cov, q.W[m_out]['mean'].T])
             
             p_t = np.zeros((n_pred,self.d[m_out]))
             #Probability t
             for d in np.arange(self.d[m_out]):
-                p_t[:,d] = self.sigmoid(m_x[:,d]*(1+math.pi/8*var_x[d,d])**(-0.5))
+                p_t[:,d] = self.sigmoid(np.dot(self.Z_mean, q.W[m_out]['mean'].T) + q.b[m_out]['mean']  [:,d]*(1+math.pi/8*q.tau_mean(m_out)**(-1)*np.eye(self.d[m_out]) + np.linalg.multi_dot([q.W[m_out]['mean'], Z_cov, q.W[m_out]['mean'].T])[d,d])**(-0.5))
             return p_t
        
     def HGamma(self, a, b):
@@ -1393,7 +1388,7 @@ class SSHIBA(object):
                     EntropyQ += q.XS[m]['LH']
                 if self.method[m] == 'mult':
                     EntropyQ += q.tS[m]['LH']
-                    
+        
         # Calculation of the E[log(p(Theta))]
         q.Z['Elogp'] = -0.5*np.trace(q.Z['prodT'])
         for m in np.arange(self.m):   
@@ -1405,16 +1400,55 @@ class SSHIBA(object):
                 q.alpha[m]['ElogpWalp'] = -(0.5* self.d[m] + self.hyper.alpha_a[m] -1)* np.sum(np.log(q.alpha[m]['b'])) -(0.5* q.Kc + self.hyper.gamma_a[m] -1)* np.sum(np.log(q.gamma[m]['b'])) #- self.hyper.gamma_b[m]*np.sum(q.gamma_mean(m))
             else:                    
                 q.alpha[m]['ElogpWalp'] = -(0.5* self.d[m] + self.hyper.alpha_a[m] -1)* np.sum(np.log(q.alpha[m]['b']))
-        
+
+
         # Total E[log(p(Theta))]
         ElogP = q.Z['Elogp']
         for m in np.arange(self.m):
             ElogP += q.tau[m]['ElogpXtau'] + q.alpha[m]['ElogpWalp'] + q.b[m]['Elogp']
         return ElogP - EntropyQ
 
+##############################################################################
+##############################################################################
+from pyro.contrib.gp.kernels.dot_product import DotProduct
+from torch.distributions import constraints
+from torch.nn import Parameter
+from pyro.nn.module import PyroParam
+
+class LinearARD(DotProduct):
+    """
+    Implementation of Linear kernel:
+
+        :math:`k(x, z) = \sigma^2 x \cdot z.`
+
+    Doing Gaussian Process regression with linear kernel is equivalent to doing a
+    linear regression.
+
+    .. note:: Here we implement the homogeneous version. To use the inhomogeneous
+        version, consider using :class:`Polynomial` kernel with ``degree=1`` or making
+        a :class:`.Sum` with a :class:`.Constant` kernel.
+    """
+
+    def __init__(self, input_dim, variance=None, active_dims=None):
+        super(LinearARD, self).__init__(input_dim, variance, active_dims)
+        if variance is None:
+            variance = torch.tensor(np.ones((input_dim,))) 
+        elif variance.shape[0] == 1:
+            variance = variance * torch.tensor(np.ones((input_dim,)))
+        elif variance.shape[0] != input_dim:
+            raise ValueError("Inputs must have the same number of features.")
+        self.variance = Parameter(variance)
+        # self.set_constraint("variance", constraints.positive)
+        self.variance = PyroParam(variance, constraints.positive)
+
+    def forward(self, X, Z=None, diag=False):
+        return self._dot_product(X * torch.sqrt(self.variance), Z * torch.sqrt(self.variance), diag)
+##############################################################################
+##############################################################################
+
 class SparseELBO(nn.Module):
 
-    def __init__(self, X, V, fs, lr=1e-3):
+    def __init__(self, X, V, fs, lr=1e-3, kernel='rbf'):
         '''
         This class optimizes the lengthscale of each dimension of the X and V data points
         to give ARD to the system.
@@ -1427,6 +1461,8 @@ class SparseELBO(nn.Module):
             to be used as support vectors.
         lr : float, optional
             Learning rate to the Adam optimizer. The default is 1e-3.
+        kernel: str, optional
+            Type of kernel to use. "linear" and "rbf" are the ones implemented.
 
         Returns
         -------
@@ -1438,25 +1474,32 @@ class SparseELBO(nn.Module):
         self.lr = lr
         self.X = torch.from_numpy(X).to(self.device)
         self.V = torch.from_numpy(V).to(self.device)
+        self.k_type = kernel
         if fs:
             is_var = False
-            var = 1.0           
+            var = 1.0
             is_leng = True
-            leng = 20.0
+            leng = 100.
         else:
             is_var = True
             var = 0.01  
             is_leng = False
-            leng = 1.0
-        self.kernel = gp.kernels.RBF(input_dim=self.X.shape[1], variance=torch.tensor(var),
-                lengthscale= leng * torch.ones([self.X.shape[1],]).to(self.device),
+            leng = 1.
+        if self.k_type == 'rbf':
+            self.kernel = gp.kernels.RBF(input_dim=self.X.shape[1], variance=torch.tensor(var),
+                lengthscale = leng * torch.ones([self.X.shape[1],]).to(self.device),
                 active_dims = range(X.shape[1]))
-        self.kernel.variance_unconstrained.requires_grad = is_var
-        self.kernel.lengthscale_unconstrained.requires_grad = is_leng
-        self.K = self.kernel.forward(self.X, self.V)
+            self.kernel.lengthscale_unconstrained.requires_grad = is_leng
+            self.kernel.variance_unconstrained.requires_grad = is_var
+        elif self.k_type == 'linear':
+            var = 0.02
+            self.kernel = LinearARD(input_dim = self.X.shape[1], variance = var * torch.ones([self.X.shape[1],]).to(self.device),
+                active_dims = range(X.shape[1]))
+            self.kernel.variance_unconstrained.requires_grad = not is_var
+        self.K = self.kernel.forward(self.X, self.V)        
         self.opt = optim.Adam(self.parameters(), lr=self.lr)
         self.to(self.device)
-        
+
     def forward(self, ZAT):
         '''
         Defines the RBF kernel and calculate the ELBO.
@@ -1473,8 +1516,7 @@ class SparseELBO(nn.Module):
 
         '''
         self.K = self.kernel.forward(self.X, self.V)
-        M = -(self.K.pow(2) - 2 * self.K * torch.from_numpy(ZAT))/2
-        return M
+        return self.K * ZAT - 0.5 * self.K.pow(2)
     
     def get_params(self):
         '''
@@ -1488,9 +1530,13 @@ class SparseELBO(nn.Module):
             A float value meaning the variance of the RBF kernel in float32.
 
         '''
-        lengthscale = np.exp(self.kernel.lengthscale_unconstrained.data.cpu().numpy())
-        return lengthscale, self.K.data.cpu().numpy(), self.kernel.variance.data.cpu().numpy()
-        
+        if self.k_type == 'rbf':
+            lengthscale = np.exp(self.kernel.lengthscale_unconstrained.data.cpu().numpy())
+            return self.K.data.cpu().numpy(), lengthscale, self.kernel.variance.data.cpu().numpy()
+        elif self.k_type == 'linear':
+            variance = np.exp(self.kernel.variance_unconstrained.data.cpu().numpy())
+            return self.K.data.cpu().numpy(), variance
+         
     def sgd_step(self, ZAT, it):
         '''
         Computes "it" steps of the Adam optimizer to optimize our ELBO.
@@ -1522,7 +1568,7 @@ class HyperParameters(object):
         number of views in the model.
     
     """
-    def __init__(self, m):
+    def __init__(self, m_i):
         self.alpha_a = []
         self.alpha_b = []
         self.gamma_a = []
@@ -1530,7 +1576,7 @@ class HyperParameters(object):
         self.tau_a = []
         self.tau_b = []
         self.xi = []
-        for m in np.arange(m): 
+        for m in np.arange(m_i): 
             self.alpha_a.append(1e-14)
             self.alpha_b.append(1e-14)
             
@@ -1539,10 +1585,6 @@ class HyperParameters(object):
             
             self.gamma_a.append(2)
             self.gamma_b.append(1)
-   
-
-
-
             
 class Qdistribution(object):
     """ Hyperparameter initialisation.
@@ -1564,18 +1606,15 @@ class Qdistribution(object):
         self.SS = SS
         self.X = X
         # Initialize some parameters that are constant
-        alpha = self.qGamma(hyper.alpha_a,hyper.alpha_b,self.m,(self.Kc*np.ones((self.m,))).astype(int))
-        self.alpha = alpha if alpha_init is None else alpha_init
-        tau = self.qGamma(hyper.tau_a,hyper.tau_b,self.m,(np.ones((self.m,))).astype(int))
-        self.tau = tau if tau_init is None else tau_init
-        # We generate gamma for all views, although the ones we are going to use 
-        # and update are the ones for which the sparsity has been specified
-        gamma = self.qGamma(hyper.gamma_a,hyper.gamma_b,self.m,self.d, area_mask)
-        self.gamma = gamma if gamma_init is None else gamma_init
+        self.alpha = self.qGamma(hyper.alpha_a,hyper.alpha_b,self.m,(self.Kc*np.ones((self.m,))).astype(int)) if alpha_init is None else alpha_init
+        self.tau = self.qGamma(hyper.tau_a,hyper.tau_b,self.m,(np.ones((self.m,))).astype(int)) if tau_init is None else tau_init
+        # We generate gamma for all views
+        self.gamma = self.qGamma(hyper.gamma_a,hyper.gamma_b,self.m,self.d, area_mask, self.sparse) if gamma_init is None else gamma_init
         
-        self.xi = []
-        for m in np.arange(self.m):            
-            self.xi.append(np.sqrt(self.X[m]['cov'] + self.X[m]['mean']**2))
+        self.xi = [None]*m
+        for m in np.arange(self.m):       
+            if method[m] == 'mult':
+                self.xi[m] = np.sqrt(self.X[m]['cov'] + self.X[m]['mean']**2)
             
         # The remaning parameters at random 
         self.init_rnd(X, method, SS, SS_mask, Z_init, W_init)
@@ -1590,8 +1629,7 @@ class Qdistribution(object):
             
         """
         
-        W = []
-        self.XS = []
+        W = [None]*self.m
         for m in np.arange(self.m):
             info = {
                 "mean":     None,
@@ -1600,7 +1638,7 @@ class Qdistribution(object):
                 "LH":       0,
                 "Elogp":    0,
             }
-            W.append(info)
+            W[m] = info
         self.XS = copy.deepcopy(W)
         self.tS = copy.deepcopy(W)
         self.b = copy.deepcopy(W)
@@ -1656,7 +1694,7 @@ class Qdistribution(object):
 
         self.W = W if None in W_init else W_init
                
-    def qGamma(self,a,b,m_i,r,mask=None):
+    def qGamma(self,a,b,m_i,r,mask=None,sp=[None]):
         """ Initialisation of variables with Gamma distribution..
     
         Parameters
@@ -1672,18 +1710,19 @@ class Qdistribution(object):
             
         """
         
-        param = []
-        for m in np.arange(m_i): 
-            info = {                
-                "a":         a[m],
-                "LH":         None,
-                "ElogpWalp":  None,
-            }
-            if mask is None or mask[m] is None:
-                info["b"] = (b[m]*np.ones((r[m],1))).flatten()
-            else:
-                info["b"] = (b[m]*np.ones((len(np.unique(mask[m])),1))).flatten()
-            param.append(info)
+        param = [None]*m_i
+        for m in np.arange(m_i):
+            if (None in sp) or sp[m] == 1:
+                info = {                
+                    "a":         a[m],
+                    "LH":         None,
+                    "ElogpWalp":  None,
+                }
+                if mask is None or mask[m] is None:
+                    info["b"] = (b[m]*np.ones((r[m],))).flatten()
+                else:
+                    info["b"] = (b[m]*np.ones((len(np.unique(mask[m])),1))).flatten()
+                param[m] = info
         return param
     
     def alpha_mean(self,m):
